@@ -26,7 +26,6 @@ from .dataset_manager import (
 )
 from .trainer import (
     validate_training_inputs,
-    load_base_model,
     train,
     TrainingConfig,
     register_adapter as register_trained_adapter,
@@ -98,8 +97,9 @@ def on_dataset_select(dataset_hf_id):
     """Handle dataset selection."""
     if not dataset_hf_id:
         return "Select a dataset first."
+    config = CURATED_DATASETS.get(dataset_hf_id, {}).get("config")
     try:
-        summary = get_dataset_summary(dataset_hf_id)
+        summary = get_dataset_summary(dataset_hf_id, config=config)
         return json.dumps(summary, indent=2, default=str)
     except Exception as e:
         return f"Error loading dataset: {e}"
@@ -138,21 +138,26 @@ def on_dataset_download(dataset_hf_id):
     if not dataset_hf_id:
         return "Please select a dataset to download."
 
+    config = CURATED_DATASETS.get(dataset_hf_id, {}).get("config")
+
     # Check if already downloaded
     try:
         from datasets import load_dataset
-        load_dataset(dataset_hf_id, download_mode="reuse_cache_if_exists")
+        if config:
+            load_dataset(dataset_hf_id, name=config, download_mode="reuse_cache_if_exists")
+        else:
+            load_dataset(dataset_hf_id, download_mode="reuse_cache_if_exists")
         app_state["selected_dataset"] = dataset_hf_id
         return f"Dataset {dataset_hf_id} is already cached locally.\nSelect it in Training tab to start fine-tuning."
     except Exception:
         pass
 
     try:
-        result = download_dataset(dataset_hf_id)
+        result = download_dataset(dataset_hf_id, config=config)
         app_state["selected_dataset"] = dataset_hf_id
-        return f"Dataset {dataset_hf_id} downloaded successfully."
+        return f"Dataset {dataset_hf_id} downloaded successfully.\nSelect it in Training tab to start fine-tuning."
     except Exception as e:
-        raise gr.Error(f"Download failed: {e}")
+        return f"Download failed: {e}"
 
 
 def on_run_inference(model_hf_id, prompt, max_tokens, temperature, top_p, do_sample):
@@ -206,8 +211,7 @@ def on_run_inference(model_hf_id, prompt, max_tokens, temperature, top_p, do_sam
                         result = finetuned_inference(base_model, adapter_path, prompt, generation_kwargs)
                         return "".join(result)
 
-        # Default: use HF as model path hint
-        from inference import base_inference
+        # Default: use base inference
         result = base_inference(model_hf_id, prompt, generation_kwargs)
         return "".join(result)
 
@@ -222,43 +226,41 @@ def on_start_training(model_hf_id, dataset_hf_id, epochs, learning_rate,
         raise gr.Error("Please select both a model and dataset to train.")
 
     adapter_id = f"adapter_{int(time.time())}"
-    progress_log = ""
+    dataset_config_name = CURATED_DATASETS.get(dataset_hf_id, {}).get("config")
+    train_config = TrainingConfig(
+        num_train_epochs=epochs,
+        learning_rate=learning_rate,
+        lora_r=int(lora_r),
+        lora_alpha=int(lora_alpha),
+        lora_dropout=float(lora_dropout),
+    )
 
-    def training_generator():
-        config = TrainingConfig(
-            num_train_epochs=epochs,
-            learning_rate=learning_rate,
-            lora_r=int(lora_r),
-            lora_alpha=int(lora_alpha),
-            lora_dropout=float(lora_dropout),
-        )
+    try:
+        from datasets import load_dataset
+        if dataset_config_name:
+            dataset = load_dataset(dataset_hf_id, name=dataset_config_name, split="train")
+        else:
+            dataset = load_dataset(dataset_hf_id, split="train")
 
-        try:
-            from dataset_manager import load_dataset
-            dataset = load_dataset(dataset_hf_id)
+        for chunk in train(model_hf_id, dataset, adapter_id, train_config):
+            if chunk.get("type") == "completed":
+                register_trained_adapter(adapter_id, model_hf_id)
+                yield f"Training complete!\nAdapter saved to: {chunk['adapter_path']}"
+                return
+            elif chunk.get("type") == "failed":
+                yield f"Training failed: {chunk.get('error', 'Unknown error')}"
+                return
 
-            for chunk in train(model_hf_id, dataset, adapter_id, config):
-                if chunk.get("type") == "completed":
-                    # Register the adapter
-                    register_trained_adapter(adapter_id, model_hf_id)
-                    yield f"✅ Training complete!\nAdapter saved to: {chunk['adapter_path']}"
-                    return
-                elif chunk.get("type") == "failed":
-                    yield f"❌ Training failed: {chunk.get('error', 'Unknown error')}"
-                    return
+            log_entry = (
+                f"Epoch {chunk.get('epoch', '?')}: "
+                f"loss={chunk.get('loss', '?'):.4f}, "
+                f"ppl={chunk.get('perplexity', '?'):.2f}, "
+                f"lr={chunk.get('lr', '?'):.2e}"
+            )
+            yield log_entry + "\n"
 
-                log_entry = (
-                    f"Epoch {chunk.get('epoch', '?')}: "
-                    f"loss={chunk.get('loss', '?'):.4f}, "
-                    f"ppl={chunk.get('perplexity', '?'):.2f}, "
-                    f"lr={chunk.get('lr', '?'):.2e}"
-                )
-                yield log_entry + "\n"
-
-        except Exception as e:
-            yield f"❌ Training failed: {e}"
-
-    return gr.Progress(generator=training_generator)
+    except Exception as e:
+        yield f"Training failed: {e}"
 
 
 def on_evaluate(model_hf_id, prompts, answers):
@@ -300,6 +302,39 @@ def on_compute_accuracy(prompts, answers, predictions):
         "accuracy": f"{accuracy * 100:.1f}%",
         "details": json.dumps(details, indent=2),
     }
+
+
+# ---- Event handlers ----
+
+def setup_events():
+    """Wire up all events."""
+
+    # Preparation tab
+    model_dropdown.select(on_model_select, model_dropdown, model_info)
+    download_model_btn.click(on_model_download, model_dropdown, download_model_result)
+    dataset_dropdown.select(on_dataset_select, dataset_dropdown, dataset_summary)
+    download_dataset_btn.click(on_dataset_download, dataset_dropdown, download_dataset_result)
+
+    # Inference tab
+    run_btn.click(
+        on_run_inference,
+        [model_dropdown2, prompt_textbox, max_tokens, temperature, top_p, do_sample],
+        inference_output,
+    )
+
+    # Training tab
+    train_btn.click(
+        on_start_training,
+        [model_dropdown3, dataset_dropdown3, epochs, learning_rate, lora_r, lora_alpha, lora_dropout],
+        training_progress,
+    )
+
+    # Evaluate tab
+    eval_run_btn.click(
+        on_compute_accuracy,
+        [eval_prompt1, eval_answer1, eval_prompt2, eval_answer2, eval_prompt3, eval_answer3, eval_result],
+        eval_accuracy,
+    )
 
 
 # ---- UI Setup ----
@@ -453,41 +488,8 @@ with gr.Blocks() as app:
             eval_result = gr.JSON(label="Evaluation Results")
             eval_accuracy = gr.Textbox(label="Accuracy", lines=3)
 
-
-# ---- Event handlers ----
-
-def setup_events():
-    """Wire up all events."""
-
-    # Preparation tab
-    model_dropdown.select(on_model_select, model_dropdown, model_info)
-    download_model_btn.click(on_model_download, model_dropdown, download_model_result)
-    dataset_dropdown.select(on_dataset_select, dataset_dropdown, dataset_summary)
-    download_dataset_btn.click(on_dataset_download, dataset_dropdown, download_dataset_result)
-
-    # Inference tab
-    run_btn.click(
-        on_run_inference,
-        [model_dropdown2, prompt_textbox, max_tokens, temperature, top_p, do_sample],
-        inference_output,
-    )
-
-    # Training tab
-    train_btn.click(
-        on_start_training,
-        [model_dropdown3, dataset_dropdown3, epochs, learning_rate, lora_r, lora_alpha, lora_dropout],
-        training_progress,
-    )
-
-    # Evaluate tab
-    eval_run_btn.click(
-        on_compute_accuracy,
-        [eval_prompt1, eval_answer1, eval_prompt2, eval_answer2, eval_prompt3, eval_answer3, eval_result],
-        eval_accuracy,
-    )
-
-
     setup_events()
+
 
 if __name__ == "__main__":
     app.launch(
