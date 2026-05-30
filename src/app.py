@@ -328,7 +328,7 @@ with gr.Blocks() as app:
                         value=None,
                     )
                     download_model_btn = gr.Button("Download Model", variant="primary")
-                                download_model_result = gr.Textbox(label="Model Status", lines=8, interactive=False)
+                    download_model_result = gr.Textbox(label="Model Status", lines=8, interactive=False)
                     model_info = gr.Textbox(label="Model Details", interactive=False)
 
                 with gr.Column(scale=1):
