@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+
+# Environment variables
+.env
+.env.local
+.env.production
+.env.*.local
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+data/logs/
+
+# Model cache (Hugging Face stores in ~/.cache/huggingface/hub, not here)
+# But local adapters and state should be versioned differently
+data/app_state.json
+
+# Coverage
+coverage/
+htmlcov/
+.coverage
+.coverage.*
+*.cover
+
+# Jupyter
+.ipynb_checkpoints
+
+# Temporary
+*.tmp
+*.tmp.bak
+*~.tmp

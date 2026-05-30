@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "thinking-model-finetune"
+version = "0.1.0"
+description = "Thinking model fine-tuning demo app with Unsloth + QLoRA + Gradio"
+requires-python = ">=3.10.12,<3.14"
+dependencies = [
+    "gradio>=4.0.0",
+    "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git",
+    "transformers>=4.40.0",
+    "datasets>=2.16.0",
+    "peft>=0.8.0",
+    "bitsandbytes>=0.43.0",
+    "accelerate>=0.27.0",
+    "huggingface_hub",
+    "torch",
+    "sentencepiece",
+    "tiktoken",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+]
