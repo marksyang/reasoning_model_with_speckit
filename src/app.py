@@ -460,7 +460,7 @@ def setup_events():
     )
 
 
-setup_events()
+    setup_events()
 
 if __name__ == "__main__":
     app.launch(
