@@ -108,19 +108,20 @@ def on_dataset_select(dataset_hf_id):
 def on_model_download(model_hf_id):
     """Download a model."""
     if not model_hf_id:
-        raise gr.Error("Please select a model to download.")
+        return "Please select a model to download."
 
-    # Check if already cached
     import os
     cache_pattern = f"models--{model_hf_id.replace('/', '--')}"
     cache_path = os.path.expanduser("~/.cache/huggingface/hub")
-    cached_dirs = [d for d in os.listdir(cache_path) if d.startswith(cache_pattern) and os.path.isdir(os.path.join(cache_path, d))] if os.path.exists(cache_path) else []
+    try:
+        cached_dirs = [d for d in os.listdir(cache_path) if d.startswith(cache_pattern) and os.path.isdir(os.path.join(cache_path, d))]
+    except OSError:
+        cached_dirs = []
 
     if cached_dirs:
         register_model(model_hf_id)
-        return f"Model {model_hf_id} is already cached locally. Ready for inference!"
+        return f"Model {model_hf_id} is already cached locally.\nReady for inference!"
 
-    # Try downloading
     try:
         result = download_model(model_hf_id)
         app_state["selected_model"] = model_hf_id
@@ -128,17 +129,14 @@ def on_model_download(model_hf_id):
         return f"Model {model_hf_id} downloaded successfully.\nCache path: {result}\nYou can now use it for inference."
     except Exception as e:
         import traceback
-        error_detail = traceback.format_exc()
-        msg = f"Download failed: {e}"
-        if "gated" in str(e).lower() or "authentication" in str(e).lower():
-            msg += "\n\nThis model requires Hub approval. Visit https://huggingface.co/" + model_hf_id + " and accept the terms."
-        return msg
+        tb = traceback.format_exc().split('\n')[-10]
+        return f"Download failed: {e}\n\n{tb}"
 
 
 def on_dataset_download(dataset_hf_id):
     """Download a dataset."""
     if not dataset_hf_id:
-        raise gr.Error("Please select a dataset to download.")
+        return "Please select a dataset to download."
 
     # Check if already downloaded
     try:
