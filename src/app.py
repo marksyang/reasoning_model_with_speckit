@@ -79,17 +79,19 @@ def get_available_datasets():
 
 # ---- Handlers ----
 
-def on_model_select(model_hf_id, available_models_list):
+def on_model_select(model_hf_id):
     """Handle model selection."""
     if model_hf_id:
         try:
-            model_info = get_model_info(model_hf_id)
-            info = json.dumps(model_info, indent=2)
+            if model_hf_id in CURATED_MODELS:
+                info = CURATED_MODELS[model_hf_id].copy()
+                info["hf_id"] = model_hf_id
+                display = json.dumps(info, indent=2, default=str)
+                return display
         except Exception:
-            info = "No additional info available."
+            return "No additional info available."
     else:
-        info = "Select a model to see details."
-    return info
+        return "Select a model to see details."
 
 
 def on_dataset_select(dataset_hf_id):
@@ -98,7 +100,7 @@ def on_dataset_select(dataset_hf_id):
         return "Select a dataset first."
     try:
         summary = get_dataset_summary(dataset_hf_id)
-        return json.dumps(summary, indent=2)
+        return json.dumps(summary, indent=2, default=str)
     except Exception as e:
         return f"Error loading dataset: {e}"
 
@@ -294,31 +296,31 @@ with gr.Blocks() as app:
                 with gr.Column(scale=1):
                     gr.Markdown("### Model")
                     model_dropdown = gr.Dropdown(
-                        choices=get_cached_models(),
+                        choices=list(CURATED_MODELS.keys()),
                         label="Select Model",
                         value=None,
                     )
                     download_model_btn = gr.Button("Download Model", variant="primary")
                     download_model_result = gr.Textbox(label="Model Status", lines=3)
-                    model_info = gr.Markdown("Select a model to see details.")
+                    model_info = gr.Textbox(label="Model Details", interactive=False)
 
                 with gr.Column(scale=1):
                     gr.Markdown("### Dataset")
                     dataset_dropdown = gr.Dropdown(
-                        choices=get_available_datasets(),
+                        choices=list(CURATED_DATASETS.keys()),
                         label="Select Dataset",
                         value=None,
                     )
                     download_dataset_btn = gr.Button("Download Dataset", variant="primary")
                     download_dataset_result = gr.Textbox(label="Dataset Status", lines=3)
-                    dataset_summary = gr.Markdown("Select a dataset to see summary.")
+                    dataset_summary = gr.Textbox(label="Dataset Summary", interactive=False)
 
         # Tab 2: Inference
         with gr.Tab("Inference"):
             gr.Markdown("## Run Inference on Selected Model")
 
             model_dropdown2 = gr.Dropdown(
-                choices=get_cached_models(),
+                choices=list(CURATED_MODELS.keys()),
                 label="Select Model",
                 value=None,
             )
@@ -356,12 +358,12 @@ with gr.Blocks() as app:
 
             with gr.Row():
                 model_dropdown3 = gr.Dropdown(
-                    choices=get_cached_models(),
+                    choices=list(CURATED_MODELS.keys()),
                     label="Select Model",
                     value=None,
                 )
                 dataset_dropdown3 = gr.Dropdown(
-                    choices=get_available_datasets(),
+                    choices=list(CURATED_DATASETS.keys()),
                     label="Select Dataset",
                     value=None,
                 )
@@ -407,7 +409,7 @@ with gr.Blocks() as app:
             gr.Markdown("## Evaluate Fine-Tuned Model")
 
             evaluate_model_dropdown = gr.Dropdown(
-                choices=get_cached_models(),
+                choices=list(CURATED_MODELS.keys()),
                 label="Select Fine-Tuned Model",
                 value=None,
             )
@@ -433,7 +435,7 @@ def setup_events():
     """Wire up all events."""
 
     # Preparation tab
-    model_dropdown.select(on_model_select, [model_dropdown, list_models()], [model_info])
+    model_dropdown.select(on_model_select, model_dropdown, model_info)
     download_model_btn.click(on_model_download, model_dropdown, download_model_result)
     dataset_dropdown.select(on_dataset_select, dataset_dropdown, dataset_summary)
     download_dataset_btn.click(on_dataset_download, dataset_dropdown, download_dataset_result)
