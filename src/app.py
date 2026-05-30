@@ -9,7 +9,7 @@ from pathlib import Path
 
 import gradio as gr
 
-from model_manager import (
+from .model_manager import (
     CURATED_MODELS,
     list_models,
     download_model,
@@ -17,21 +17,21 @@ from model_manager import (
     register_model,
     get_model_cache_path,
 )
-from dataset_manager import (
+from .dataset_manager import (
     CURATED_DATASETS,
     list_datasets,
     download_dataset,
     get_dataset_summary,
     format_for_finetuning,
 )
-from trainer import (
+from .trainer import (
     validate_training_inputs,
     load_base_model,
     train,
     TrainingConfig,
     register_adapter as register_trained_adapter,
 )
-from inference import base_inference, finetuned_inference
+from .inference import base_inference, finetuned_inference
 
 logger = logging.getLogger(__name__)
 

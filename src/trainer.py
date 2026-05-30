@@ -13,7 +13,7 @@ from transformers import TrainingArguments, DataCollatorForSeq2Seq, Trainer
 from trl import SFTTrainer
 from datasets import Dataset
 
-from dataset_manager import format_for_finetuning
+from .dataset_manager import format_for_finetuning
 
 logger = logging.getLogger(__name__)
 
@@ -209,7 +209,7 @@ def register_adapter(adapter_id: str, base_model_hf_id: str) -> dict:
         "created_at": "2026-05-30",
     }
 
-    from model_manager import load_app_state, save_app_state
+    from .model_manager import load_app_state, save_app_state
     state = load_app_state()
 
     state["registered_adapters"].append(adapter_id)
