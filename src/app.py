@@ -109,19 +109,46 @@ def on_model_download(model_hf_id):
     """Download a model."""
     if not model_hf_id:
         raise gr.Error("Please select a model to download.")
+
+    # Check if already cached
+    import os
+    cache_pattern = f"models--{model_hf_id.replace('/', '--')}"
+    cache_path = os.path.expanduser("~/.cache/huggingface/hub")
+    cached_dirs = [d for d in os.listdir(cache_path) if d.startswith(cache_pattern) and os.path.isdir(os.path.join(cache_path, d))] if os.path.exists(cache_path) else []
+
+    if cached_dirs:
+        register_model(model_hf_id)
+        return f"Model {model_hf_id} is already cached locally. Ready for inference!"
+
+    # Try downloading
     try:
-        cache_path = download_model(model_hf_id)
+        result = download_model(model_hf_id)
         app_state["selected_model"] = model_hf_id
         register_model(model_hf_id)
-        return f"Model {model_hf_id} downloaded to: {cache_path}\nYou can now use it for inference."
+        return f"Model {model_hf_id} downloaded successfully.\nCache path: {result}\nYou can now use it for inference."
     except Exception as e:
-        raise gr.Error(f"Download failed: {e}")
+        import traceback
+        error_detail = traceback.format_exc()
+        msg = f"Download failed: {e}"
+        if "gated" in str(e).lower() or "authentication" in str(e).lower():
+            msg += "\n\nThis model requires Hub approval. Visit https://huggingface.co/" + model_hf_id + " and accept the terms."
+        return msg
 
 
 def on_dataset_download(dataset_hf_id):
     """Download a dataset."""
     if not dataset_hf_id:
         raise gr.Error("Please select a dataset to download.")
+
+    # Check if already downloaded
+    try:
+        from datasets import load_dataset
+        load_dataset(dataset_hf_id, download_mode="reuse_cache_if_exists")
+        app_state["selected_dataset"] = dataset_hf_id
+        return f"Dataset {dataset_hf_id} is already cached locally.\nSelect it in Training tab to start fine-tuning."
+    except Exception:
+        pass
+
     try:
         result = download_dataset(dataset_hf_id)
         app_state["selected_dataset"] = dataset_hf_id
@@ -301,7 +328,7 @@ with gr.Blocks() as app:
                         value=None,
                     )
                     download_model_btn = gr.Button("Download Model", variant="primary")
-                    download_model_result = gr.Textbox(label="Model Status", lines=3)
+                                download_model_result = gr.Textbox(label="Model Status", lines=8, interactive=False)
                     model_info = gr.Textbox(label="Model Details", interactive=False)
 
                 with gr.Column(scale=1):
