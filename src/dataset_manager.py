@@ -10,35 +10,36 @@ logger = logging.getLogger(__name__)
 
 # Pre-approved reasoning datasets
 CURATED_DATASETS = {
-    "gsm8k": {
+    "openai/gsm8k": {
         "name": "GSM8K",
         "description": "Grade school math word problems",
         "column_names": ["question", "answer"],
+        "config": "main",
     },
-    "squad": {
+    "rajpurkar/squad": {
         "name": "SQuAD",
         "description": "Stanford Question Answering Dataset",
-        "column_names": ["question", "context", "answers"],
+        "column_names": ["id", "title", "context", "question", "answers"],
     },
-    "ai-forever/ru-opinolympia": {
-        "name": "Ru Opinion",
-        "description": "Russian opinion analysis",
-        "column_names": ["text", "label"],
+    "Dahoas/cot_gsm8k": {
+        "name": "CoT GSM8K",
+        "description": "GSM8K with chain-of-thought reasoning",
+        "column_names": ["question", "answer", "prompt", "response"],
     },
-    "nlp/wikianswers-corpus": {
-        "name": "WikiAnswers",
-        "description": "Wikipedia Q&A corpus",
-        "column_names": ["question", "answer"],
-    },
-    "ImaginaryCamera/ohsumct-cinematic-reviews": {
-        "name": "Cinematic Reviews",
-        "description": "Movie reviews with sentiment",
-        "column_names": ["review", "sentiment"],
+    "HuggingFaceH4/no_robots": {
+        "name": "No Robots",
+        "description": "Human-written instruction data",
+        "column_names": ["prompt", "prompt_id", "messages", "category"],
     },
     "OpenAssistant/oasst1": {
         "name": "OpenAssistant",
         "description": "Multi-turn conversation dataset",
-        "column_names": ["text", "oasst_id", "parent_id"],
+        "column_names": ["message_id", "parent_id", "text", "role", "lang"],
+    },
+    "HuggingFaceH4/ultrachat_200k": {
+        "name": "UltraChat 200K",
+        "description": "High-quality multi-turn conversations",
+        "column_names": ["prompt", "prompt_id", "messages"],
     },
 }
 
@@ -66,6 +67,7 @@ def list_datasets() -> list[dict]:
             "name": info["name"],
             "description": info["description"],
             "column_names": info["column_names"],
+            "config": info.get("config"),
             "is_cached": False,
             "status": "pending",
         })
@@ -73,12 +75,15 @@ def list_datasets() -> list[dict]:
     return datasets
 
 
-def download_dataset(hf_id: str) -> str:
+def download_dataset(hf_id: str, config: str | None = None) -> str:
     """Download a dataset from Hugging Face Hub."""
-    logger.info(f"Downloading dataset {hf_id}...")
+    logger.info(f"Downloading dataset {hf_id} (config={config})...")
 
     try:
-        dataset = load_dataset(hf_id, download_mode="reuse_cache_if_exists")
+        if config:
+            dataset = load_dataset(hf_id, name=config, download_mode="reuse_cache_if_exists")
+        else:
+            dataset = load_dataset(hf_id, download_mode="reuse_cache_if_exists")
         logger.info(f"Dataset {hf_id} downloaded successfully.")
         return hf_id
     except Exception as e:
@@ -86,12 +91,15 @@ def download_dataset(hf_id: str) -> str:
         raise
 
 
-def get_dataset_summary(hf_id: str) -> dict:
+def get_dataset_summary(hf_id: str, config: str | None = None) -> dict:
     """Get summary statistics for a dataset."""
-    logger.info(f"Loading dataset summary for {hf_id}...")
+    logger.info(f"Loading dataset summary for {hf_id} (config={config})...")
 
     try:
-        dataset = load_dataset(hf_id, download_mode="reuse_cache_if_exists")
+        if config:
+            dataset = load_dataset(hf_id, name=config, download_mode="reuse_cache_if_exists")
+        else:
+            dataset = load_dataset(hf_id, download_mode="reuse_cache_if_exists")
         summary = {
             "hf_id": hf_id,
             "name": CURATED_DATASETS.get(hf_id, {}).get("name", hf_id),
@@ -148,6 +156,7 @@ def get_available_datasets() -> list[dict]:
             "name": info["name"],
             "description": info["description"],
             "column_names": info["column_names"],
+            "config": info.get("config"),
             "is_cached": False,
             "status": "pending",
         })

@@ -1,17 +1,17 @@
-"""Unsloth + QLoRA fine-tuning with streaming logs."""
+"""Unsloth + QLoRA fine-tuning with streaming logs (MLX backend on macOS)."""
 
 import json
 import logging
 import os
-import uuid
+import queue
+import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Generator
 
 from unsloth import FastLanguageModel
-from transformers import TrainingArguments, DataCollatorForSeq2Seq, Trainer
-from trl import SFTTrainer
-from datasets import Dataset
+from datasets import DatasetDict
 
 from .dataset_manager import format_for_finetuning
 
@@ -23,29 +23,44 @@ logger = logging.getLogger(__name__)
 @dataclass
 class TrainingConfig:
     """Configuration for fine-tuning."""
-    # LoRA parameters
     lora_r: int = 8
     lora_alpha: int = 16
-    lora_dropout: float = 0.05
-    target_modules: list[str] = field(
-        default_factory=lambda: ["q_proj", "k_proj", "v_proj", "o_proj",
-                                 "gate_proj", "up_proj", "down_proj"]
-    )
-    # Training hyperparameters
+    lora_dropout: float = 0.0
     num_train_epochs: int = 1
-    per_device_train_batch_size: int = 1
-    gradient_accumulation_steps: int = 2
-    learning_rate: float = 2e-4
+    batch_size: int = 4
+    gradient_accumulation_steps: int = 1
+    learning_rate: float = 5e-5
     max_seq_length: int = 2048
-    logging_steps: int = 1
-    # Training flags
-    use_gradient_checkpointing: bool = True
-    use_rslora: bool = False
-    fp16: bool = True
-    bf16: bool = False
+    logging_steps: int = 10
 
 
-# ---- Core functions ----
+class _ProgressCallback:
+    """Bridge MLX TrainingCallback to a queue for progress streaming."""
+
+    def __init__(self, q: queue.Queue):
+        self.q = q
+
+    def on_train_loss_report(self, train_info: dict):
+        try:
+            self.q.put({
+                "type": "progress",
+                "iteration": train_info.get("iteration", 0),
+                "train_loss": train_info.get("train_loss", 0),
+                "learning_rate": train_info.get("learning_rate", 0),
+                "tokens_per_second": train_info.get("tokens_per_second", 0),
+            }, block=False)
+        except queue.Full:
+            pass
+
+    def on_val_loss_report(self, val_info: dict):
+        try:
+            self.q.put({
+                "type": "val",
+                "val_loss": val_info.get("val_loss", 0),
+            }, block=False)
+        except queue.Full:
+            pass
+
 
 def validate_training_inputs(base_model_path: str, dataset_path: str) -> bool:
     """Validate that both model and dataset paths exist."""
@@ -58,27 +73,6 @@ def validate_training_inputs(base_model_path: str, dataset_path: str) -> bool:
     return True
 
 
-def load_base_model(model_id: str, config: TrainingConfig) -> FastLanguageModel:
-    """Load the base model with Unsloth FastLanguageModel and 4-bit quantization."""
-    logger.info(f"Loading base model: {model_id} with Unsloth...")
-
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=model_id,
-        max_seq_length=config.max_seq_length,
-        load_in_4bit=True,
-        fast_inference=False,
-    )
-
-    return model, tokenizer
-
-
-def format_dataset(dataset, tokenizer: object, config: TrainingConfig) -> Dataset:
-    """Format the dataset for SFT training."""
-    formatted = format_for_finetuning(dataset)
-    # Convert to SFT format
-    return Dataset.from_dict({"text": formatted})
-
-
 def train(
     base_model_id: str,
     dataset,
@@ -88,119 +82,142 @@ def train(
     logging_callback=None,
 ) -> Generator[dict, None, None]:
     """
-    Full fine-tuning with Unsloth + QLoRA.
+    Full fine-tuning with Unsloth + QLoRA (MLX backend).
 
     Yields progress updates: {epoch, loss, perplexity, lr, message}
     On completion: {type: "completed", adapter_path: str}
     On failure: {type: "failed", error: str}
     """
-    adapter_dir = Path(f"data/adapters/{adapter_id}/lora_adapter")
-    log_dir = Path(f"data/logs/{adapter_id}")
-    log_dir.mkdir(parents=True, exist_ok=True)
+    adapter_dir = Path(f"data/adapters/{adapter_id}")
+    adapter_dir.mkdir(parents=True, exist_ok=True)
 
-    # Validate model exists
+    # Load model
     try:
-        model, tokenizer = load_base_model(base_model_id, config)
+        model, tokenizer = FastLanguageModel.from_pretrained(
+            model_name=base_model_id,
+            max_seq_length=config.max_seq_length,
+            load_in_4bit=True,
+            fast_inference=False,
+        )
     except Exception as e:
         error_msg = f"Failed to load model: {e}"
         logger.error(error_msg)
         yield {"type": "failed", "error": error_msg}
         return
 
-    # Save model locally first for adapter saving
-    local_model_path = f"data/adapters/{adapter_id}/base_model"
-    model.save_pretrained(local_model_path)
-    tokenizer.save_pretrained(local_model_path)
+    # Prepare dataset — pick train split from DatasetDict
+    if isinstance(dataset, DatasetDict):
+        train_split = dataset.get("train", dataset[list(dataset.keys())[0]])
+    else:
+        train_split = dataset
 
+    # Format as alpaca-style prompts
     try:
-        # Apply LoRA adapter
-        model = FastLanguageModel.get_peft_model(
-            model,
-            r=config.lora_r,
-            lora_alpha=config.lora_alpha,
-            lora_dropout=config.lora_dropout,
-            target_modules=config.target_modules,
-            use_gradient_checkpointing="unsloth" if config.use_gradient_checkpointing else True,
-            use_rslora=config.use_rslora,
-            random_state=42,
-        )
-
-        # Format dataset
-        formatted = format_for_finetuning(dataset)
-
-        # Setup training
-        training_args = TrainingArguments(
-            per_device_train_batch_size=config.per_device_train_batch_size,
-            gradient_accumulation_steps=config.gradient_accumulation_steps,
-            warmup_ratio=0.1,
-            num_train_epochs=config.num_train_epochs,
-            learning_rate=config.learning_rate,
-            fp16=not config.bf16,
-            bf16=config.bf16,
-            logging_steps=config.logging_steps,
-            save_strategy="epoch",
-            output_dir=adapter_dir,
-            report_to="none",
-            max_grad_norm=1.0,
-        )
-
-        trainer = Trainer(
-            model=model,
-            tokenizer=tokenizer,
-            train_dataset=Dataset.from_dict({"text": formatted}),
-            data_collator=DataCollatorForSeq2Seq(tokenizer=tokenizer, padding=True),
-            args=training_args,
-        )
-
-        logger.info("Starting training...")
-
-        # Wrap train call in generator for streaming
-        yield {"epoch": 0, "loss": 0.0, "perplexity": 1.0, "lr": config.learning_rate, "message": "Starting training..."}
-
-        for epoch in range(config.num_train_epochs):
-            training_result = trainer.train()
-            metrics = training_result.metrics
-            metrics["epoch"] = epoch + 1
-
-            # Calculate loss and perplexity
-            train_loss = metrics.get("train_loss", 0.0)
-            perplexity = round(float(exp(train_loss)), 2)
-
-            yield {
-                "epoch": epoch + 1,
-                "loss": train_loss,
-                "perplexity": perplexity,
-                "lr": config.learning_rate * (1 - epoch / config.num_train_epochs),
-                "message": f"Epoch {epoch + 1} complete",
-            }
-
-            if logging_callback:
-                logging_callback(self)
-
-        # Save the fine-tuned adapter
-        model.save_pretrained(str(adapter_dir))
-        tokenizer.save_pretrained(str(adapter_dir))
-
-        logger.info(f"Adapter saved to {adapter_dir}")
-
-        yield {
-            "type": "completed",
-            "adapter_path": str(adapter_dir),
-            "message": "Training complete!",
-        }
-
+        formatted_texts = format_for_finetuning(train_split)
     except Exception as e:
-        error_msg = f"Training failed: {e}"
+        import traceback
+        error_msg = f"Failed to format dataset: {e}\n{traceback.format_exc()}"
         logger.error(error_msg)
         yield {"type": "failed", "error": error_msg}
-        raise
+        return
+
+    # Create MLX dataset
+    from mlx_lm.tuner.datasets import TextDataset
+    train_set = TextDataset([{"text": t} for t in formatted_texts], tokenizer, text_key="text")
+
+    # Dummy empty validation set
+    val_set = TextDataset([], tokenizer, text_key="text")
+
+    # Progress queue
+    q: queue.Queue = queue.Queue(maxsize=100)
+    callback = _ProgressCallback(q)
+
+    # Build args namespace for mlx_lm.lora.train_model
+    from argparse import Namespace
+    num_layers = len(model.layers)
+    args = Namespace(
+        seed=42,
+        num_layers=num_layers,
+        fine_tune_type="lora",
+        lora_parameters={"rank": config.lora_r, "scale": config.lora_alpha, "dropout": config.lora_dropout},
+        resume_adapter_file=None,
+        adapter_path=str(adapter_dir),
+        batch_size=config.batch_size,
+        iters=max(len(formatted_texts) // config.batch_size * config.num_train_epochs, 1),
+        val_batches=0,
+        steps_per_report=max(config.logging_steps, 1),
+        steps_per_eval=0,
+        save_every=max(len(formatted_texts) // config.batch_size, 1),
+        max_seq_length=config.max_seq_length,
+        grad_checkpoint=False,
+        grad_accumulation_steps=config.gradient_accumulation_steps,
+        lr_schedule=None,
+        learning_rate=config.learning_rate,
+        optimizer="adamw",
+        optimizer_config={"adamw": {}},
+    )
+
+    yield {
+        "epoch": 0,
+        "loss": 0.0,
+        "perplexity": 1.0,
+        "lr": config.learning_rate,
+        "message": "Starting training...",
+    }
+
+    # Run training — poll queue until done
+    def _run():
+        try:
+            from mlx_lm.lora import train_model
+            train_model(args, model, train_set, val_set, callback)
+            q.put({"type": "done", "adapter_path": str(adapter_dir)})
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            q.put({"type": "error", "error": f"{e}\n{tb}"})
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+
+    # Yield progress updates
+    while True:
+        try:
+            msg = q.get(timeout=2.0)
+        except queue.Empty:
+            continue
+
+        if msg["type"] == "done":
+            yield {
+                "type": "completed",
+                "adapter_path": msg["adapter_path"],
+                "message": "Training complete!",
+            }
+            return
+        elif msg["type"] == "error":
+            error_msg = f"Training failed: {msg['error']}"
+            logger.error(error_msg)
+            yield {"type": "failed", "error": error_msg}
+            return
+        elif msg["type"] == "progress":
+            from math import exp
+            loss = msg["train_loss"]
+            ppl = round(float(exp(loss)), 2) if loss > 0 else 1.0
+            yield {
+                "epoch": 0,
+                "loss": loss,
+                "perplexity": ppl,
+                "lr": msg["learning_rate"],
+                "message": (
+                    f"Iter {msg['iteration']}: loss={loss:.4f}, "
+                    f"ppl={ppl:.2f}, lr={msg['learning_rate']:.2e}, "
+                    f"tok/s={msg['tokens_per_second']:.0f}"
+                ),
+            }
 
 
 def register_adapter(adapter_id: str, base_model_hf_id: str) -> dict:
     """Register a trained adapter in app state."""
-    adapter_dir = Path(f"data/adapters/{adapter_id}/lora_adapter")
-    if not adapter_dir.exists():
-        raise FileNotFoundError(f"Adapter path does not exist: {adapter_dir}")
+    adapter_dir = Path(f"data/adapters/{adapter_id}")
 
     model_metadata = {
         "adapter_id": adapter_id,
@@ -229,29 +246,13 @@ def register_adapter(adapter_id: str, base_model_hf_id: str) -> dict:
 
 def load_adapter(base_model_path: str, adapter_path: str) -> object:
     """Load a fine-tuned model from base model + adapter."""
-    try:
-        from unsloth import FastLanguageModel
+    import mlx.core as mx
+    from mlx_lm import load
 
-        model, tokenizer = FastLanguageModel.from_pretrained(
-            model_name=base_model_path,
-            max_seq_length=2048,
-            load_in_4bit=True,
-        )
-
-        model.load_adapter(adapter_path)
-        return model, tokenizer
-    except ImportError:
-        # Fall back to standard PEFT
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-        from peft import PeftModel
-
-        model = AutoModelForCausalLM.from_pretrained(
-            base_model_path,
-            torch_dtype=torch.float16,
-            device_map="auto",
-            low_cpu_mem_usage=True,
-        )
-        model = PeftModel.from_pretrained(model, adapter_path)
-        tokenizer = AutoTokenizer.from_pretrained(base_model_path)
-
-        return model, tokenizer
+    model, tokenizer = load(base_model_path)
+    adapter_weights = mx.load(
+        str(Path(adapter_path) / "adapters.safetensors"),
+        format="safetensors",
+    )
+    model.update(adapter_weights)
+    return model, tokenizer

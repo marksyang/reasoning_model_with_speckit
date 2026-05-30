@@ -26,7 +26,6 @@ from .dataset_manager import (
 )
 from .trainer import (
     validate_training_inputs,
-    load_base_model,
     train,
     TrainingConfig,
     register_adapter as register_trained_adapter,
@@ -79,26 +78,29 @@ def get_available_datasets():
 
 # ---- Handlers ----
 
-def on_model_select(model_hf_id, available_models_list):
+def on_model_select(model_hf_id):
     """Handle model selection."""
     if model_hf_id:
         try:
-            model_info = get_model_info(model_hf_id)
-            info = json.dumps(model_info, indent=2)
+            if model_hf_id in CURATED_MODELS:
+                info = CURATED_MODELS[model_hf_id].copy()
+                info["hf_id"] = model_hf_id
+                display = json.dumps(info, indent=2, default=str)
+                return display
         except Exception:
-            info = "No additional info available."
+            return "No additional info available."
     else:
-        info = "Select a model to see details."
-    return info
+        return "Select a model to see details."
 
 
 def on_dataset_select(dataset_hf_id):
     """Handle dataset selection."""
     if not dataset_hf_id:
         return "Select a dataset first."
+    config = CURATED_DATASETS.get(dataset_hf_id, {}).get("config")
     try:
-        summary = get_dataset_summary(dataset_hf_id)
-        return json.dumps(summary, indent=2)
+        summary = get_dataset_summary(dataset_hf_id, config=config)
+        return json.dumps(summary, indent=2, default=str)
     except Exception as e:
         return f"Error loading dataset: {e}"
 
@@ -106,26 +108,56 @@ def on_dataset_select(dataset_hf_id):
 def on_model_download(model_hf_id):
     """Download a model."""
     if not model_hf_id:
-        raise gr.Error("Please select a model to download.")
+        return "Please select a model to download."
+
+    import os
+    cache_pattern = f"models--{model_hf_id.replace('/', '--')}"
+    cache_path = os.path.expanduser("~/.cache/huggingface/hub")
     try:
-        cache_path = download_model(model_hf_id)
+        cached_dirs = [d for d in os.listdir(cache_path) if d.startswith(cache_pattern) and os.path.isdir(os.path.join(cache_path, d))]
+    except OSError:
+        cached_dirs = []
+
+    if cached_dirs:
+        register_model(model_hf_id)
+        return f"Model {model_hf_id} is already cached locally.\nReady for inference!"
+
+    try:
+        result = download_model(model_hf_id)
         app_state["selected_model"] = model_hf_id
         register_model(model_hf_id)
-        return f"Model {model_hf_id} downloaded to: {cache_path}\nYou can now use it for inference."
+        return f"Model {model_hf_id} downloaded successfully.\nCache path: {result}\nYou can now use it for inference."
     except Exception as e:
-        raise gr.Error(f"Download failed: {e}")
+        import traceback
+        tb = traceback.format_exc().split('\n')[-10]
+        return f"Download failed: {e}\n\n{tb}"
 
 
 def on_dataset_download(dataset_hf_id):
     """Download a dataset."""
     if not dataset_hf_id:
-        raise gr.Error("Please select a dataset to download.")
+        return "Please select a dataset to download."
+
+    config = CURATED_DATASETS.get(dataset_hf_id, {}).get("config")
+
+    # Check if already downloaded
     try:
-        result = download_dataset(dataset_hf_id)
+        from datasets import load_dataset
+        if config:
+            load_dataset(dataset_hf_id, name=config, download_mode="reuse_cache_if_exists")
+        else:
+            load_dataset(dataset_hf_id, download_mode="reuse_cache_if_exists")
         app_state["selected_dataset"] = dataset_hf_id
-        return f"Dataset {dataset_hf_id} downloaded successfully."
+        return f"Dataset {dataset_hf_id} is already cached locally.\nSelect it in Training tab to start fine-tuning."
+    except Exception:
+        pass
+
+    try:
+        result = download_dataset(dataset_hf_id, config=config)
+        app_state["selected_dataset"] = dataset_hf_id
+        return f"Dataset {dataset_hf_id} downloaded successfully.\nSelect it in Training tab to start fine-tuning."
     except Exception as e:
-        raise gr.Error(f"Download failed: {e}")
+        return f"Download failed: {e}"
 
 
 def on_run_inference(model_hf_id, prompt, max_tokens, temperature, top_p, do_sample):
@@ -179,8 +211,7 @@ def on_run_inference(model_hf_id, prompt, max_tokens, temperature, top_p, do_sam
                         result = finetuned_inference(base_model, adapter_path, prompt, generation_kwargs)
                         return "".join(result)
 
-        # Default: use HF as model path hint
-        from inference import base_inference
+        # Default: use base inference
         result = base_inference(model_hf_id, prompt, generation_kwargs)
         return "".join(result)
 
@@ -195,43 +226,41 @@ def on_start_training(model_hf_id, dataset_hf_id, epochs, learning_rate,
         raise gr.Error("Please select both a model and dataset to train.")
 
     adapter_id = f"adapter_{int(time.time())}"
-    progress_log = ""
+    dataset_config_name = CURATED_DATASETS.get(dataset_hf_id, {}).get("config")
+    train_config = TrainingConfig(
+        num_train_epochs=epochs,
+        learning_rate=learning_rate,
+        lora_r=int(lora_r),
+        lora_alpha=int(lora_alpha),
+        lora_dropout=float(lora_dropout),
+    )
 
-    def training_generator():
-        config = TrainingConfig(
-            num_train_epochs=epochs,
-            learning_rate=learning_rate,
-            lora_r=int(lora_r),
-            lora_alpha=int(lora_alpha),
-            lora_dropout=float(lora_dropout),
-        )
+    try:
+        from datasets import load_dataset
+        if dataset_config_name:
+            dataset = load_dataset(dataset_hf_id, name=dataset_config_name, split="train")
+        else:
+            dataset = load_dataset(dataset_hf_id, split="train")
 
-        try:
-            from dataset_manager import load_dataset
-            dataset = load_dataset(dataset_hf_id)
+        for chunk in train(model_hf_id, dataset, adapter_id, train_config):
+            if chunk.get("type") == "completed":
+                register_trained_adapter(adapter_id, model_hf_id)
+                yield f"Training complete!\nAdapter saved to: {chunk['adapter_path']}"
+                return
+            elif chunk.get("type") == "failed":
+                yield f"Training failed: {chunk.get('error', 'Unknown error')}"
+                return
 
-            for chunk in train(model_hf_id, dataset, adapter_id, config):
-                if chunk.get("type") == "completed":
-                    # Register the adapter
-                    register_trained_adapter(adapter_id, model_hf_id)
-                    yield f"✅ Training complete!\nAdapter saved to: {chunk['adapter_path']}"
-                    return
-                elif chunk.get("type") == "failed":
-                    yield f"❌ Training failed: {chunk.get('error', 'Unknown error')}"
-                    return
+            log_entry = (
+                f"Epoch {chunk.get('epoch', '?')}: "
+                f"loss={chunk.get('loss', '?'):.4f}, "
+                f"ppl={chunk.get('perplexity', '?'):.2f}, "
+                f"lr={chunk.get('lr', '?'):.2e}"
+            )
+            yield log_entry + "\n"
 
-                log_entry = (
-                    f"Epoch {chunk.get('epoch', '?')}: "
-                    f"loss={chunk.get('loss', '?'):.4f}, "
-                    f"ppl={chunk.get('perplexity', '?'):.2f}, "
-                    f"lr={chunk.get('lr', '?'):.2e}"
-                )
-                yield log_entry + "\n"
-
-        except Exception as e:
-            yield f"❌ Training failed: {e}"
-
-    return gr.Progress(generator=training_generator)
+    except Exception as e:
+        yield f"Training failed: {e}"
 
 
 def on_evaluate(model_hf_id, prompts, answers):
@@ -275,6 +304,39 @@ def on_compute_accuracy(prompts, answers, predictions):
     }
 
 
+# ---- Event handlers ----
+
+def setup_events():
+    """Wire up all events."""
+
+    # Preparation tab
+    model_dropdown.select(on_model_select, model_dropdown, model_info)
+    download_model_btn.click(on_model_download, model_dropdown, download_model_result)
+    dataset_dropdown.select(on_dataset_select, dataset_dropdown, dataset_summary)
+    download_dataset_btn.click(on_dataset_download, dataset_dropdown, download_dataset_result)
+
+    # Inference tab
+    run_btn.click(
+        on_run_inference,
+        [model_dropdown2, prompt_textbox, max_tokens, temperature, top_p, do_sample],
+        inference_output,
+    )
+
+    # Training tab
+    train_btn.click(
+        on_start_training,
+        [model_dropdown3, dataset_dropdown3, epochs, learning_rate, lora_r, lora_alpha, lora_dropout],
+        training_progress,
+    )
+
+    # Evaluate tab
+    eval_run_btn.click(
+        on_compute_accuracy,
+        [eval_prompt1, eval_answer1, eval_prompt2, eval_answer2, eval_prompt3, eval_answer3, eval_result],
+        eval_accuracy,
+    )
+
+
 # ---- UI Setup ----
 
 css = """
@@ -282,7 +344,7 @@ css = """
 .progress-bar { height: 8px !important; background: linear-gradient(90deg, #4285f4, #34a853) !important; }
 """
 
-with gr.Blocks(theme=gr.themes.Soft(primary_hue="blue"), css=css) as app:
+with gr.Blocks() as app:
     gr.Markdown("# 🚀 Thinking Model Fine-Tuning Demo")
 
     with gr.Tabs():
@@ -294,31 +356,31 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="blue"), css=css) as app:
                 with gr.Column(scale=1):
                     gr.Markdown("### Model")
                     model_dropdown = gr.Dropdown(
-                        choices=get_cached_models(),
+                        choices=list(CURATED_MODELS.keys()),
                         label="Select Model",
                         value=None,
                     )
                     download_model_btn = gr.Button("Download Model", variant="primary")
-                    download_model_result = gr.Textbox(label="Model Status", lines=3)
-                    model_info = gr.Markdown("Select a model to see details.")
+                    download_model_result = gr.Textbox(label="Model Status", lines=8, interactive=False)
+                    model_info = gr.Textbox(label="Model Details", interactive=False)
 
                 with gr.Column(scale=1):
                     gr.Markdown("### Dataset")
                     dataset_dropdown = gr.Dropdown(
-                        choices=get_available_datasets(),
+                        choices=list(CURATED_DATASETS.keys()),
                         label="Select Dataset",
                         value=None,
                     )
                     download_dataset_btn = gr.Button("Download Dataset", variant="primary")
                     download_dataset_result = gr.Textbox(label="Dataset Status", lines=3)
-                    dataset_summary = gr.Markdown("Select a dataset to see summary.")
+                    dataset_summary = gr.Textbox(label="Dataset Summary", interactive=False)
 
         # Tab 2: Inference
         with gr.Tab("Inference"):
             gr.Markdown("## Run Inference on Selected Model")
 
             model_dropdown2 = gr.Dropdown(
-                choices=get_cached_models(),
+                choices=list(CURATED_MODELS.keys()),
                 label="Select Model",
                 value=None,
             )
@@ -356,12 +418,12 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="blue"), css=css) as app:
 
             with gr.Row():
                 model_dropdown3 = gr.Dropdown(
-                    choices=get_cached_models(),
+                    choices=list(CURATED_MODELS.keys()),
                     label="Select Model",
                     value=None,
                 )
                 dataset_dropdown3 = gr.Dropdown(
-                    choices=get_available_datasets(),
+                    choices=list(CURATED_DATASETS.keys()),
                     label="Select Dataset",
                     value=None,
                 )
@@ -374,7 +436,6 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="blue"), css=css) as app:
                 learning_rate = gr.Slider(
                     minimum=1e-5, maximum=1e-3, value=2e-4, step=1e-5,
                     label="Learning Rate",
-                    type="logarithmic",
                 )
                 lora_r = gr.Slider(
                     minimum=4, maximum=32, value=8, step=4,
@@ -408,7 +469,7 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="blue"), css=css) as app:
             gr.Markdown("## Evaluate Fine-Tuned Model")
 
             evaluate_model_dropdown = gr.Dropdown(
-                choices=get_cached_models(),
+                choices=list(CURATED_MODELS.keys()),
                 label="Select Fine-Tuned Model",
                 value=None,
             )
@@ -427,41 +488,8 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="blue"), css=css) as app:
             eval_result = gr.JSON(label="Evaluation Results")
             eval_accuracy = gr.Textbox(label="Accuracy", lines=3)
 
+    setup_events()
 
-# ---- Event handlers ----
-
-def setup_events():
-    """Wire up all events."""
-
-    # Preparation tab
-    model_dropdown.select(on_model_select, [model_dropdown, list_models()], [model_info])
-    download_model_btn.click(on_model_download, model_dropdown, download_model_result)
-    dataset_dropdown.select(on_dataset_select, dataset_dropdown, dataset_summary)
-    download_dataset_btn.click(on_dataset_download, dataset_dropdown, download_dataset_result)
-
-    # Inference tab
-    run_btn.click(
-        on_run_inference,
-        [model_dropdown2, prompt_textbox, max_tokens, temperature, top_p, do_sample],
-        inference_output,
-    )
-
-    # Training tab
-    train_btn.click(
-        on_start_training,
-        [model_dropdown3, dataset_dropdown3, epochs, learning_rate, lora_r, lora_alpha, lora_dropout],
-        training_progress,
-    )
-
-    # Evaluate tab
-    eval_run_btn.click(
-        on_compute_accuracy,
-        [eval_prompt1, eval_answer1, eval_prompt2, eval_answer2, eval_prompt3, eval_answer3, eval_result],
-        eval_accuracy,
-    )
-
-
-setup_events()
 
 if __name__ == "__main__":
     app.launch(
@@ -469,4 +497,6 @@ if __name__ == "__main__":
         server_port=7860,
         share=False,
         inbrowser=True,
+        theme=gr.themes.Soft(primary_hue="blue"),
+        css=css,
     )
