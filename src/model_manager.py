@@ -86,12 +86,14 @@ def get_model_cache_path() -> Path:
 def list_models_by_param(max_params: int) -> list[ModelInfo]:
     """List models from Hugging Face filtered by parameter count."""
     api = HfApi()
-    models = api.list_models(
-        search=f"model_family:transformers",
-        sort="downloads",
-        direction=-1,
-        limit=100,
-    )
+    try:
+        models = api.list_models(
+            search="model_family:transformers",
+            sort="downloads",
+            limit=200,
+        )
+    except Exception:
+        return []
 
     result = []
     seen = set()
@@ -109,9 +111,7 @@ def list_models_by_param(max_params: int) -> list[ModelInfo]:
             continue
 
         try:
-            param_count = int(
-                model.card_data["model_index"]["Parameters"]
-            )
+            param_count = int(model.card_data["model_index"]["Parameters"])
         except (TypeError, ValueError):
             continue
 
@@ -123,7 +123,10 @@ def list_models_by_param(max_params: int) -> list[ModelInfo]:
                 is_cached=False,
             ))
 
-    return result[:20]
+        if len(result) >= 20:
+            break
+
+    return result
 
 
 def get_cached_models() -> list[dict]:
@@ -174,7 +177,10 @@ def list_models() -> list[dict]:
         })
 
     # Add local HF list (filtered by params)
-    local_models = list_models_by_param(MAX_PARAMETERS)
+    try:
+        local_models = list_models_by_param(MAX_PARAMETERS)
+    except Exception:
+        local_models = []
     for model in local_models:
         if model.hf_id not in cached_ids:
             available.append({
