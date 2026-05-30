@@ -282,7 +282,7 @@ css = """
 .progress-bar { height: 8px !important; background: linear-gradient(90deg, #4285f4, #34a853) !important; }
 """
 
-with gr.Blocks(theme=gr.themes.Soft(primary_hue="blue"), css=css) as app:
+with gr.Blocks() as app:
     gr.Markdown("# 🚀 Thinking Model Fine-Tuning Demo")
 
     with gr.Tabs():
@@ -374,7 +374,6 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="blue"), css=css) as app:
                 learning_rate = gr.Slider(
                     minimum=1e-5, maximum=1e-3, value=2e-4, step=1e-5,
                     label="Learning Rate",
-                    type="logarithmic",
                 )
                 lora_r = gr.Slider(
                     minimum=4, maximum=32, value=8, step=4,
@@ -469,4 +468,6 @@ if __name__ == "__main__":
         server_port=7860,
         share=False,
         inbrowser=True,
+        theme=gr.themes.Soft(primary_hue="blue"),
+        css=css,
     )
