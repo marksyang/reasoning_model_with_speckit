@@ -8,6 +8,8 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+
+_stop_event = threading.Event()
 from typing import Optional, Generator
 
 from unsloth import FastLanguageModel
@@ -37,14 +39,16 @@ class TrainingConfig:
 class _ProgressCallback:
     """Bridge MLX TrainingCallback to a queue for progress streaming."""
 
-    def __init__(self, q: queue.Queue):
+    def __init__(self, q: queue.Queue, total_iters: int = 0):
         self.q = q
+        self.total_iters = total_iters
 
     def on_train_loss_report(self, train_info: dict):
         try:
             self.q.put({
                 "type": "progress",
                 "iteration": train_info.get("iteration", 0),
+                "total_iters": self.total_iters,
                 "train_loss": train_info.get("train_loss", 0),
                 "learning_rate": train_info.get("learning_rate", 0),
                 "tokens_per_second": train_info.get("tokens_per_second", 0),
@@ -130,7 +134,8 @@ def train(
 
     # Progress queue
     q: queue.Queue = queue.Queue(maxsize=100)
-    callback = _ProgressCallback(q)
+    total_iters = max(len(formatted_texts) // config.batch_size * config.num_train_epochs, 1)
+    callback = _ProgressCallback(q, total_iters=total_iters)
 
     # Build args namespace for mlx_lm.lora.train_model
     from argparse import Namespace
@@ -143,7 +148,7 @@ def train(
         resume_adapter_file=None,
         adapter_path=str(adapter_dir),
         batch_size=config.batch_size,
-        iters=max(len(formatted_texts) // config.batch_size * config.num_train_epochs, 1),
+        iters=total_iters,
         val_batches=0,
         steps_per_report=max(config.logging_steps, 1),
         steps_per_eval=0,
@@ -157,20 +162,14 @@ def train(
         optimizer_config={"adamw": {}},
     )
 
-    yield {
-        "epoch": 0,
-        "loss": 0.0,
-        "perplexity": 1.0,
-        "lr": config.learning_rate,
-        "message": "Starting training...",
-    }
-
     # Run training — poll queue until done
     def _run():
         try:
             from mlx_lm.lora import train_model
             train_model(args, model, train_set, val_set, callback)
             q.put({"type": "done", "adapter_path": str(adapter_dir)})
+        except (KeyboardInterrupt, SystemExit):
+            q.put({"type": "stopped"})
         except Exception as e:
             import traceback
             tb = traceback.format_exc()
@@ -180,10 +179,15 @@ def train(
     t.start()
 
     # Yield progress updates
-    while True:
+    while not _stop_event.is_set():
         try:
             msg = q.get(timeout=2.0)
         except queue.Empty:
+            if _stop_event.is_set() and t.is_alive():
+                import ctypes
+                ctypes.pythonapi.PyThreadState_SetAsyncExc(
+                    ctypes.c_ulong(t.ident), ctypes.py_object(KeyboardInterrupt)
+                )
             continue
 
         if msg["type"] == "done":
@@ -198,12 +202,17 @@ def train(
             logger.error(error_msg)
             yield {"type": "failed", "error": error_msg}
             return
+        elif msg["type"] == "stopped":
+            yield {"type": "failed", "error": "Training stopped by user."}
+            return
         elif msg["type"] == "progress":
             from math import exp
             loss = msg["train_loss"]
             ppl = round(float(exp(loss)), 2) if loss > 0 else 1.0
             yield {
                 "epoch": 0,
+                "iteration": msg.get("iteration", 0),
+                "total_iters": msg.get("total_iters", 0),
                 "loss": loss,
                 "perplexity": ppl,
                 "lr": msg["learning_rate"],
@@ -256,3 +265,9 @@ def load_adapter(base_model_path: str, adapter_path: str) -> object:
     )
     model.update(adapter_weights)
     return model, tokenizer
+
+
+def stop_training() -> str:
+    """Signal the training thread to stop."""
+    _stop_event.set()
+    return "Stopping training..."
