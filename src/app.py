@@ -29,6 +29,7 @@ from .trainer import (
     train,
     TrainingConfig,
     register_adapter as register_trained_adapter,
+    stop_training,
 )
 from .inference import base_inference, finetuned_inference
 
@@ -235,6 +236,15 @@ def on_start_training(model_hf_id, dataset_hf_id, epochs, learning_rate,
         lora_dropout=float(lora_dropout),
     )
 
+    # Accumulate full log for progressive display
+    log_lines = []
+
+    # Get current registered adapters for dropdown update
+    current_adapters = list(CURATED_MODELS.keys()) + app_state.get("registered_adapters", [])
+
+    # Hide start button, show stop button, reset progress bar
+    yield 0, "", "", gr.Dropdown(choices=current_adapters), gr.Button(visible=False), gr.Button(visible=True)
+
     try:
         from datasets import load_dataset
         if dataset_config_name:
@@ -245,63 +255,58 @@ def on_start_training(model_hf_id, dataset_hf_id, epochs, learning_rate,
         for chunk in train(model_hf_id, dataset, adapter_id, train_config):
             if chunk.get("type") == "completed":
                 register_trained_adapter(adapter_id, model_hf_id)
-                yield f"Training complete!\nAdapter saved to: {chunk['adapter_path']}"
+                final_msg = f"Training complete!\nAdapter saved to: {chunk['adapter_path']}"
+                log_lines.append(final_msg)
+                yield 100, final_msg, "\n".join(log_lines), gr.Dropdown(choices=current_adapters + [adapter_id]), gr.Button(visible=True), gr.Button(visible=False)
                 return
             elif chunk.get("type") == "failed":
-                yield f"Training failed: {chunk.get('error', 'Unknown error')}"
+                err_msg = f"Training failed: {chunk.get('error', 'Unknown error')}"
+                log_lines.append(err_msg)
+                yield 0, err_msg, "\n".join(log_lines), gr.Dropdown(choices=current_adapters), gr.Button(visible=True), gr.Button(visible=False)
                 return
 
+            # Calculate progress percentage
+            total = chunk.get("total_iters", 0)
+            progress_pct = round(chunk.get("iteration", 0) / total * 100, 1) if total > 0 else 0
+
             log_entry = (
-                f"Epoch {chunk.get('epoch', '?')}: "
-                f"loss={chunk.get('loss', '?'):.4f}, "
-                f"ppl={chunk.get('perplexity', '?'):.2f}, "
-                f"lr={chunk.get('lr', '?'):.2e}"
+                f"Iter {chunk.get('iteration', '?')}/{total}: "
+                f"loss={chunk.get('loss', 0):.4f}, "
+                f"ppl={chunk.get('perplexity', 0):.2f}, "
+                f"lr={chunk.get('lr', 0):.2e}"
             )
-            yield log_entry + "\n"
+            log_lines.append(log_entry)
+            yield progress_pct, log_entry, "\n".join(log_lines), gr.Dropdown(choices=current_adapters), gr.Button(visible=False), gr.Button(visible=True)
 
     except Exception as e:
-        yield f"Training failed: {e}"
+        err_msg = f"Training failed: {e}"
+        log_lines.append(err_msg)
+        yield 0, err_msg, "\n".join(log_lines), gr.Dropdown(choices=current_adapters), gr.Button(visible=True), gr.Button(visible=False)
 
 
-def on_evaluate(model_hf_id, prompts, answers):
-    """Evaluate the fine-tuned model on validation examples."""
+def on_run_evaluation(model_hf_id, prompt1, answer1, prompt2, answer2, prompt3, answer3):
+    """Run inference on sample prompts and compute accuracy."""
     if not model_hf_id:
         raise gr.Error("Please select a model to evaluate.")
 
-    results = []
+    prompts = [prompt1, prompt2, prompt3]
+    answers = [answer1, answer2, answer3]
+    details = []
+    correct = 0
+
     for prompt, answer in zip(prompts, answers):
         try:
-            result = on_run_inference(model_hf_id, prompt, 512, 0.7, 0.9, True)
-            results.append({"prompt": prompt, "answer": answer, "result": result})
-        except Exception as e:
-            results.append({"prompt": prompt, "answer": answer, "error": str(e)})
-
-    return json.dumps(results, indent=2)
-
-
-def on_compute_accuracy(prompts, answers, predictions):
-    """Compute accuracy for evaluation."""
-    correct = 0
-    total = len(prompts)
-    details = []
-
-    for i, (prompt, answer, prediction) in enumerate(zip(prompts, answers, predictions)):
-        if i < len(prompts):
-            p = prediction.get("result", "") if isinstance(prediction, dict) else str(prediction)
-            a = answer.get("answer", "") if isinstance(answer, dict) else str(answer)
-            # Simple exact match for now (real implementation would parse reasoning)
-            is_correct = p.strip() == a.strip()
+            prediction = on_run_inference(model_hf_id, prompt, 512, 0.7, 0.9, True)
+            is_correct = prediction.strip() == answer.strip()
             if is_correct:
                 correct += 1
-            details.append({"prompt": prompts[i], "expected": a, "got": p, "correct": is_correct})
+            details.append({"prompt": prompt, "expected": answer, "got": prediction, "correct": is_correct})
+        except Exception as e:
+            details.append({"prompt": prompt, "expected": answer, "error": str(e), "correct": False})
 
+    total = len(prompts)
     accuracy = correct / total if total > 0 else 0
-    return {
-        "correct": correct,
-        "total": total,
-        "accuracy": f"{accuracy * 100:.1f}%",
-        "details": json.dumps(details, indent=2),
-    }
+    return details, f"{correct}/{total} ({accuracy * 100:.1f}%)"
 
 
 # ---- Event handlers ----
@@ -326,14 +331,19 @@ def setup_events():
     train_btn.click(
         on_start_training,
         [model_dropdown3, dataset_dropdown3, epochs, learning_rate, lora_r, lora_alpha, lora_dropout],
-        training_progress,
+        [training_progress_bar, training_progress, training_log, registered_models_dropdown, train_btn, stop_btn],
+    )
+    stop_btn.click(
+        stop_training,
+        [],
+        [training_progress],
     )
 
     # Evaluate tab
     eval_run_btn.click(
-        on_compute_accuracy,
-        [eval_prompt1, eval_answer1, eval_prompt2, eval_answer2, eval_prompt3, eval_answer3, eval_result],
-        eval_accuracy,
+        on_run_evaluation,
+        [evaluate_model_dropdown, eval_prompt1, eval_answer1, eval_prompt2, eval_answer2, eval_prompt3, eval_answer3],
+        [eval_result, eval_accuracy],
     )
 
 
@@ -450,7 +460,14 @@ with gr.Blocks() as app:
                     label="LoRA Dropout",
                 )
 
-            train_btn = gr.Button("Start Training", variant="primary")
+            with gr.Row():
+                train_btn = gr.Button("Start Training", variant="primary")
+                stop_btn = gr.Button("Stop Training", variant="stop", visible=False)
+            training_progress_bar = gr.Slider(
+                minimum=0, maximum=100, value=0, step=1,
+                label="Training Progress",
+                interactive=False,
+            )
             training_progress = gr.Textbox(
                 lines=15, label="Training Progress", interactive=False,
             )
@@ -458,7 +475,7 @@ with gr.Blocks() as app:
                 lines=10, label="Training Log", interactive=False,
             )
             registered_models_dropdown = gr.Dropdown(
-                choices=[],
+                choices=list(CURATED_MODELS.keys()),
                 label="Registered Fine-Tuned Models",
                 value=None,
             )
