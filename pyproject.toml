@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools", "wheel"]
-build-backend = "setuptools.backends._legacy:_Backend"
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "thinking-model-finetune"
@@ -25,4 +25,12 @@ dependencies = [
 dev = [
     "pytest>=7.4.0",
     "pytest-cov>=4.1.0",
+    "pytest-playwright>=0.4.0",
+    "playwright>=1.40.0",
+    "pytest-xdist>=3.3.0",
+    "pytest-timeout>=2.1.0",
 ]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
