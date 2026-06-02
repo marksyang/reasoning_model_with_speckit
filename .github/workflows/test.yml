@@ -36,6 +36,7 @@ jobs:
 
       - name: Run unit tests with coverage
         run: |
+          source .venv/bin/activate
           pytest tests/unit/ -v --cov=src --cov-report=term-missing --cov-report=xml --cov-fail-under=90
 
       - name: Upload coverage to Codecov
