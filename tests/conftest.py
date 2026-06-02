@@ -1,12 +1,15 @@
 """Test configuration and fixtures."""
 
 import json
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 import pytest
 
-import sys
-sys.path.insert(0, str(Path(__file__).parent.parent))
+# Add project root to path for imports
+sys_path = str(Path(__file__).parent.parent)
+if sys_path not in __import__("sys").path:
+    __import__("sys").path.insert(0, sys_path)
 
 
 @pytest.fixture
@@ -69,10 +72,16 @@ def mock_curated_models():
 def mock_curated_datasets():
     """Mock curated datasets list."""
     return {
-        "gsm8k": {
+        "openai/gsm8k": {
             "name": "GSM8K",
             "description": "Grade school math word problems",
             "column_names": ["question", "answer"],
+            "config": "main",
+        },
+        "rajpurkar/squad": {
+            "name": "SQuAD",
+            "description": "Stanford Question Answering Dataset",
+            "column_names": ["id", "title", "context", "question", "answers"],
         },
     }
 
@@ -94,3 +103,29 @@ def mock_app_state(tmp_dir):
                 json.dump(data, f, indent=2)
 
     return MockState()
+
+
+@pytest.fixture
+def model_manager(tmp_dir, mock_curated_models):
+    """Create a ModelManager instance with mocked state."""
+    from src.model_manager import CURATED_MODELS, load_app_state, save_app_state
+
+    # Patch CURATED_MODELS
+    with patch("src.model_manager.CURATED_MODELS", mock_curated_models):
+        # Patch state paths
+        with patch("src.model_manager.APP_STATE_PATH", tmp_dir / "app_state.json"):
+            yield MagicMock(
+                curated_models=mock_curated_models,
+                state_path=tmp_dir / "app_state.json",
+            )
+
+
+@pytest.fixture
+def dataset_manager(tmp_dir, mock_curated_datasets):
+    """Create a DatasetManager instance with mocked state."""
+    from src.dataset_manager import CURATED_DATASETS
+
+    with patch("src.dataset_manager.CURATED_DATASETS", mock_curated_datasets):
+        yield MagicMock(
+            curated_datasets=mock_curated_datasets,
+        )

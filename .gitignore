@@ -45,6 +45,10 @@ htmlcov/
 .coverage
 .coverage.*
 *.cover
+coverage.xml
+
+# Generated adapters (from tests)
+data/adapters/
 
 # Jupyter
 .ipynb_checkpoints
