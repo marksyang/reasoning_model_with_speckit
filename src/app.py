@@ -1,5 +1,6 @@
 """Thinking Model Fine-Tuning Demo App — Gradio UI."""
 
+import argparse
 import json
 import logging
 import os
@@ -56,11 +57,14 @@ app_state = {
 def init_app():
     """Initialize the app state."""
     global app_state
-    if Path("data/app_state.json").exists():
-        with open("data/app_state.json") as f:
+    data_dir = Path("data")
+    data_dir.mkdir(parents=True, exist_ok=True)
+    state_file = data_dir / "app_state.json"
+    if state_file.exists():
+        with open(state_file) as f:
             app_state = json.load(f)
     else:
-        with open("data/app_state.json", "w") as f:
+        with open(state_file, "w") as f:
             json.dump(app_state, f, indent=2)
 
 
@@ -509,11 +513,16 @@ with gr.Blocks() as app:
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Thinking Model Fine-Tuning Demo")
+    parser.add_argument("--host", default="127.0.0.1", help="Server host")
+    parser.add_argument("--port", type=int, default=7860, help="Server port")
+    args = parser.parse_args()
+
     app.launch(
-        server_name="127.0.0.1",
-        server_port=7860,
+        server_name=args.host,
+        server_port=args.port,
         share=False,
-        inbrowser=True,
+        inbrowser=False,
         theme=gr.themes.Soft(primary_hue="blue"),
         css=css,
     )
