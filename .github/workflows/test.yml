@@ -68,10 +68,13 @@ jobs:
         run: |
           uv pip install -r requirements.txt
           uv pip install -e ".[dev]"
+          uv pip install playwright
 
-      - name: Install Playwright browsers
-        run: playwright install --with-deps chromium
+      - name: Install Chromium
+        run: |
+          uv run python -m playwright install chromium
 
       - name: Run E2E tests
         run: |
+          source .venv/bin/activate
           pytest tests/e2e/ -v --timeout=120 -n auto
