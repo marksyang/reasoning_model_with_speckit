@@ -40,26 +40,38 @@ def gradio_server():
     port = 7860
 
     proc = subprocess.Popen(
-        ["python", "-m", "src.app", "--port", str(port)],
+        [sys.executable, "-m", "src.app", "--port", str(port)],
         cwd=str(project_root),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
 
     # Wait for server to be ready
-    max_wait = 30
+    max_wait = 120
     start = time.time()
     while time.time() - start < max_wait:
+        # 檢查子程序是否提前退出
+        return_code = proc.poll()
+        if return_code is not None:
+            _, stderr = proc.communicate()
+            pytest.fail(
+                f"Gradio process exited prematurely with code {return_code}. "
+                f"stderr: {stderr.decode('utf-8', errors='replace')}"
+            )
         try:
             import urllib.request
 
             urllib.request.urlopen(f"http://localhost:{port}", timeout=1)
             break
         except Exception:
-            time.sleep(0.5)
+            time.sleep(1)
     else:
         proc.kill()
-        pytest.fail("Gradio server failed to start")
+        _, stderr = proc.communicate()
+        pytest.fail(
+            f"Gradio server failed to start within {max_wait}s. "
+            f"stderr: {stderr.decode('utf-8', errors='replace')}"
+        )
 
     yield f"http://localhost:{port}"
 
