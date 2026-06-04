@@ -95,133 +95,164 @@ def train(
     adapter_dir = Path(f"data/adapters/{adapter_id}")
     adapter_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load model
+    # Setup training log file
+    log_dir = Path("data/logs")
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file_path = log_dir / f"{adapter_id}.log"
+    log_file = open(log_file_path, "w", encoding="utf-8")
+    log_file.write(f"Training started: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+    log_file.write(f"Base model: {base_model_id}\n")
+    log_file.write(f"Adapter ID: {adapter_id}\n")
+    log_file.write(f"Config: {config}\n")
+    log_file.write("-" * 60 + "\n")
+    log_file.flush()
+
     try:
-        model, tokenizer = FastLanguageModel.from_pretrained(
-            model_name=base_model_id,
-            max_seq_length=config.max_seq_length,
-            load_in_4bit=True,
-            fast_inference=False,
-        )
-    except Exception as e:
-        error_msg = f"Failed to load model: {e}"
-        logger.error(error_msg)
-        yield {"type": "failed", "error": error_msg}
-        return
-
-    # Prepare dataset — pick train split from DatasetDict
-    if isinstance(dataset, DatasetDict):
-        train_split = dataset.get("train", dataset[list(dataset.keys())[0]])
-    else:
-        train_split = dataset
-
-    # Format as alpaca-style prompts
-    try:
-        formatted_texts = format_for_finetuning(train_split)
-    except Exception as e:
-        import traceback
-        error_msg = f"Failed to format dataset: {e}\n{traceback.format_exc()}"
-        logger.error(error_msg)
-        yield {"type": "failed", "error": error_msg}
-        return
-
-    # Create MLX dataset
-    from mlx_lm.tuner.datasets import TextDataset
-    train_set = TextDataset([{"text": t} for t in formatted_texts], tokenizer, text_key="text")
-
-    # Dummy empty validation set
-    val_set = TextDataset([], tokenizer, text_key="text")
-
-    # Progress queue
-    q: queue.Queue = queue.Queue(maxsize=100)
-    total_iters = max(len(formatted_texts) // config.batch_size * config.num_train_epochs, 1)
-    callback = _ProgressCallback(q, total_iters=total_iters)
-
-    # Build args namespace for mlx_lm.lora.train_model
-    from argparse import Namespace
-    num_layers = len(model.layers)
-    args = Namespace(
-        seed=42,
-        num_layers=num_layers,
-        fine_tune_type="lora",
-        lora_parameters={"rank": config.lora_r, "scale": config.lora_alpha, "dropout": config.lora_dropout},
-        resume_adapter_file=None,
-        adapter_path=str(adapter_dir),
-        batch_size=config.batch_size,
-        iters=total_iters,
-        val_batches=0,
-        steps_per_report=max(config.logging_steps, 1),
-        steps_per_eval=0,
-        save_every=max(len(formatted_texts) // config.batch_size, 1),
-        max_seq_length=config.max_seq_length,
-        grad_checkpoint=False,
-        grad_accumulation_steps=config.gradient_accumulation_steps,
-        lr_schedule=None,
-        learning_rate=config.learning_rate,
-        optimizer="adamw",
-        optimizer_config={"adamw": {}},
-    )
-
-    # Run training — poll queue until done
-    def _run():
+        # Load model
         try:
-            from mlx_lm.lora import train_model
-            train_model(args, model, train_set, val_set, callback)
-            q.put({"type": "done", "adapter_path": str(adapter_dir)})
-        except (KeyboardInterrupt, SystemExit):
-            q.put({"type": "stopped"})
+            model, tokenizer = FastLanguageModel.from_pretrained(
+                model_name=base_model_id,
+                max_seq_length=config.max_seq_length,
+                load_in_4bit=True,
+                fast_inference=False,
+            )
         except Exception as e:
-            import traceback
-            tb = traceback.format_exc()
-            q.put({"type": "error", "error": f"{e}\n{tb}"})
-
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
-
-    # Yield progress updates
-    while not _stop_event.is_set():
-        try:
-            msg = q.get(timeout=2.0)
-        except queue.Empty:
-            if _stop_event.is_set() and t.is_alive():
-                import ctypes
-                ctypes.pythonapi.PyThreadState_SetAsyncExc(
-                    ctypes.c_ulong(t.ident), ctypes.py_object(KeyboardInterrupt)
-                )
-            continue
-
-        if msg["type"] == "done":
-            yield {
-                "type": "completed",
-                "adapter_path": msg["adapter_path"],
-                "message": "Training complete!",
-            }
-            return
-        elif msg["type"] == "error":
-            error_msg = f"Training failed: {msg['error']}"
+            error_msg = f"Failed to load model: {e}"
+            log_file.write(f"{error_msg}\n")
+            log_file.flush()
             logger.error(error_msg)
             yield {"type": "failed", "error": error_msg}
             return
-        elif msg["type"] == "stopped":
-            yield {"type": "failed", "error": "Training stopped by user."}
+
+        # Prepare dataset — pick train split from DatasetDict
+        if isinstance(dataset, DatasetDict):
+            train_split = dataset.get("train", dataset[list(dataset.keys())[0]])
+        else:
+            train_split = dataset
+
+        # Format as alpaca-style prompts
+        try:
+            formatted_texts = format_for_finetuning(train_split)
+        except Exception as e:
+            import traceback
+            error_msg = f"Failed to format dataset: {e}\n{traceback.format_exc()}"
+            log_file.write(f"{error_msg}\n")
+            log_file.flush()
+            logger.error(error_msg)
+            yield {"type": "failed", "error": error_msg}
             return
-        elif msg["type"] == "progress":
-            from math import exp
-            loss = msg["train_loss"]
-            ppl = round(float(exp(loss)), 2) if loss > 0 else 1.0
-            yield {
-                "epoch": 0,
-                "iteration": msg.get("iteration", 0),
-                "total_iters": msg.get("total_iters", 0),
-                "loss": loss,
-                "perplexity": ppl,
-                "lr": msg["learning_rate"],
-                "message": (
+
+        # Create MLX dataset
+        from mlx_lm.tuner.datasets import TextDataset
+        train_set = TextDataset([{"text": t} for t in formatted_texts], tokenizer, text_key="text")
+
+        # Dummy empty validation set
+        val_set = TextDataset([], tokenizer, text_key="text")
+
+        # Progress queue
+        q: queue.Queue = queue.Queue(maxsize=100)
+        total_iters = max(len(formatted_texts) // config.batch_size * config.num_train_epochs, 1)
+        callback = _ProgressCallback(q, total_iters=total_iters)
+
+        # Build args namespace for mlx_lm.lora.train_model
+        from argparse import Namespace
+        num_layers = len(model.layers)
+        args = Namespace(
+            seed=42,
+            num_layers=num_layers,
+            fine_tune_type="lora",
+            lora_parameters={"rank": config.lora_r, "scale": config.lora_alpha, "dropout": config.lora_dropout},
+            resume_adapter_file=None,
+            adapter_path=str(adapter_dir),
+            batch_size=config.batch_size,
+            iters=total_iters,
+            val_batches=0,
+            steps_per_report=max(config.logging_steps, 1),
+            steps_per_eval=0,
+            save_every=max(len(formatted_texts) // config.batch_size, 1),
+            max_seq_length=config.max_seq_length,
+            grad_checkpoint=False,
+            grad_accumulation_steps=config.gradient_accumulation_steps,
+            lr_schedule=None,
+            learning_rate=config.learning_rate,
+            optimizer="adamw",
+            optimizer_config={"adamw": {}},
+        )
+
+        # Run training — poll queue until done
+        def _run():
+            try:
+                from mlx_lm.lora import train_model
+                train_model(args, model, train_set, val_set, callback)
+                q.put({"type": "done", "adapter_path": str(adapter_dir)})
+            except (KeyboardInterrupt, SystemExit):
+                q.put({"type": "stopped"})
+            except Exception as e:
+                import traceback
+                tb = traceback.format_exc()
+                q.put({"type": "error", "error": f"{e}\n{tb}"})
+
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+
+        # Yield progress updates
+        while not _stop_event.is_set():
+            try:
+                msg = q.get(timeout=2.0)
+            except queue.Empty:
+                if _stop_event.is_set() and t.is_alive():
+                    import ctypes
+                    ctypes.pythonapi.PyThreadState_SetAsyncExc(
+                        ctypes.c_ulong(t.ident), ctypes.py_object(KeyboardInterrupt)
+                    )
+                continue
+
+            if msg["type"] == "done":
+                done_msg = "Training complete!"
+                log_file.write(f"{done_msg}\n")
+                log_file.write(f"Completed: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                log_file.flush()
+                yield {
+                    "type": "completed",
+                    "adapter_path": msg["adapter_path"],
+                    "message": done_msg,
+                }
+                return
+            elif msg["type"] == "error":
+                error_msg = f"Training failed: {msg['error']}"
+                log_file.write(f"{error_msg}\n")
+                log_file.flush()
+                logger.error(error_msg)
+                yield {"type": "failed", "error": error_msg}
+                return
+            elif msg["type"] == "stopped":
+                stopped_msg = "Training stopped by user."
+                log_file.write(f"{stopped_msg}\n")
+                log_file.flush()
+                yield {"type": "failed", "error": stopped_msg}
+                return
+            elif msg["type"] == "progress":
+                from math import exp
+                loss = msg["train_loss"]
+                ppl = round(float(exp(loss)), 2) if loss > 0 else 1.0
+                progress_msg = (
                     f"Iter {msg['iteration']}: loss={loss:.4f}, "
                     f"ppl={ppl:.2f}, lr={msg['learning_rate']:.2e}, "
                     f"tok/s={msg['tokens_per_second']:.0f}"
-                ),
-            }
+                )
+                log_file.write(f"{progress_msg}\n")
+                log_file.flush()
+                yield {
+                    "epoch": 0,
+                    "iteration": msg.get("iteration", 0),
+                    "total_iters": msg.get("total_iters", 0),
+                    "loss": loss,
+                    "perplexity": ppl,
+                    "lr": msg["learning_rate"],
+                    "message": progress_msg,
+                }
+    finally:
+        log_file.close()
 
 
 def register_adapter(adapter_id: str, base_model_hf_id: str) -> dict:
