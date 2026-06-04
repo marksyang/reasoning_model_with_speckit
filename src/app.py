@@ -199,22 +199,18 @@ def on_run_inference(model_hf_id, prompt, max_tokens, temperature, top_p, do_sam
             is_finetuned = model_hf_id in app_state.get("registered_adapters", [])
 
             if is_finetuned:
-                # Find adapter path
+                # Find adapter path and base model from training_runs
                 adapter_path = None
+                base_model_hf_id = None
                 for run in app_state.get("training_runs", []):
                     if run.get("adapter_id") == model_hf_id:
                         adapter_path = run.get("adapter_path")
+                        base_model_hf_id = run.get("base_model")
                         break
 
-                if adapter_path:
-                    base_model = CURATED_MODELS.get(
-                        next((k for k, v in CURATED_MODELS.items()
-                              if v.get("adapter_id") == model_hf_id), None),
-                        {}).get("hf_id", "")
-
-                    if base_model:
-                        result = finetuned_inference(base_model, adapter_path, prompt, generation_kwargs)
-                        return "".join(result)
+                if adapter_path and base_model_hf_id:
+                    result = finetuned_inference(base_model_hf_id, adapter_path, prompt, generation_kwargs)
+                    return "".join(result)
 
         # Default: use base inference
         result = base_inference(model_hf_id, prompt, generation_kwargs)
@@ -227,6 +223,7 @@ def on_run_inference(model_hf_id, prompt, max_tokens, temperature, top_p, do_sam
 def on_start_training(model_hf_id, dataset_hf_id, epochs, learning_rate,
                       lora_r, lora_alpha, lora_dropout):
     """Start fine-tuning with streaming progress."""
+    global app_state
     if not model_hf_id or not dataset_hf_id:
         raise gr.Error("Please select both a model and dataset to train.")
 
@@ -247,7 +244,7 @@ def on_start_training(model_hf_id, dataset_hf_id, epochs, learning_rate,
     current_adapters = list(CURATED_MODELS.keys()) + app_state.get("registered_adapters", [])
 
     # Hide start button, show stop button, reset progress bar
-    yield 0, "", "", gr.Dropdown(choices=current_adapters), gr.Button(visible=False), gr.Button(visible=True)
+    yield 0, "", "", gr.update(choices=current_adapters, interactive=True), gr.Button(visible=False), gr.Button(visible=True)
 
     try:
         from datasets import load_dataset
@@ -259,14 +256,20 @@ def on_start_training(model_hf_id, dataset_hf_id, epochs, learning_rate,
         for chunk in train(model_hf_id, dataset, adapter_id, train_config):
             if chunk.get("type") == "completed":
                 register_trained_adapter(adapter_id, model_hf_id)
+                # 重新從檔案載入 app_state，確保註冊結果反映在記憶體中
+                state_file = Path("data") / "app_state.json"
+                if state_file.exists():
+                    with open(state_file) as f:
+                        app_state = json.load(f)
                 final_msg = f"Training complete!\nAdapter saved to: {chunk['adapter_path']}"
                 log_lines.append(final_msg)
-                yield 100, final_msg, "\n".join(log_lines), gr.Dropdown(choices=current_adapters + [adapter_id]), gr.Button(visible=True), gr.Button(visible=False)
+                updated_adapters = list(CURATED_MODELS.keys()) + app_state.get("registered_adapters", [])
+                yield 100, final_msg, "\n".join(log_lines), gr.update(choices=updated_adapters, value=adapter_id, interactive=True), gr.Button(visible=True), gr.Button(visible=False)
                 return
             elif chunk.get("type") == "failed":
                 err_msg = f"Training failed: {chunk.get('error', 'Unknown error')}"
                 log_lines.append(err_msg)
-                yield 0, err_msg, "\n".join(log_lines), gr.Dropdown(choices=current_adapters), gr.Button(visible=True), gr.Button(visible=False)
+                yield 0, err_msg, "\n".join(log_lines), gr.update(choices=current_adapters, interactive=True), gr.Button(visible=True), gr.Button(visible=False)
                 return
 
             # Calculate progress percentage
@@ -280,12 +283,12 @@ def on_start_training(model_hf_id, dataset_hf_id, epochs, learning_rate,
                 f"lr={chunk.get('lr', 0):.2e}"
             )
             log_lines.append(log_entry)
-            yield progress_pct, log_entry, "\n".join(log_lines), gr.Dropdown(choices=current_adapters), gr.Button(visible=False), gr.Button(visible=True)
+            yield progress_pct, log_entry, "\n".join(log_lines), gr.update(choices=current_adapters, interactive=True), gr.Button(visible=False), gr.Button(visible=True)
 
     except Exception as e:
         err_msg = f"Training failed: {e}"
         log_lines.append(err_msg)
-        yield 0, err_msg, "\n".join(log_lines), gr.Dropdown(choices=current_adapters), gr.Button(visible=True), gr.Button(visible=False)
+        yield 0, err_msg, "\n".join(log_lines), gr.update(choices=current_adapters, interactive=True), gr.Button(visible=True), gr.Button(visible=False)
 
 
 def on_run_evaluation(model_hf_id, prompt1, answer1, prompt2, answer2, prompt3, answer3):
@@ -315,6 +318,16 @@ def on_run_evaluation(model_hf_id, prompt1, answer1, prompt2, answer2, prompt3, 
 
 # ---- Event handlers ----
 
+def get_all_model_choices():
+    """Get all available model choices (curated + registered adapters)."""
+    return list(CURATED_MODELS.keys()) + app_state.get("registered_adapters", [])
+
+
+def on_registered_model_change():
+    """Update Evaluate tab dropdown when registered models change."""
+    return gr.update(choices=get_all_model_choices())
+
+
 def setup_events():
     """Wire up all events."""
 
@@ -336,6 +349,12 @@ def setup_events():
         on_start_training,
         [model_dropdown3, dataset_dropdown3, epochs, learning_rate, lora_r, lora_alpha, lora_dropout],
         [training_progress_bar, training_progress, training_log, registered_models_dropdown, train_btn, stop_btn],
+    )
+    # Sync registered models dropdown with Evaluate tab
+    registered_models_dropdown.change(
+        on_registered_model_change,
+        [],
+        [evaluate_model_dropdown],
     )
     stop_btn.click(
         stop_training,
@@ -482,6 +501,7 @@ with gr.Blocks() as app:
                 choices=list(CURATED_MODELS.keys()),
                 label="Registered Fine-Tuned Models",
                 value=None,
+                interactive=True,
             )
             evaluate_btn = gr.Button("Evaluate", variant="secondary", interactive=False)
 
