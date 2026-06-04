@@ -128,6 +128,6 @@ def test_training_registered_models_dropdown(prepared_page: Page):
     dropdown = prepared_page.get_by_label("Registered Fine-Tuned Models")
     expect(dropdown).to_be_visible()
 
-    # 該 dropdown 初始為 disabled（無訓練記錄時）
+    # 該 dropdown 初始為 enabled（可選擇 curated models 或訓練後的 adapter）
     # 不點擊，只驗證存在
-    expect(dropdown).to_be_disabled()
+    expect(dropdown).to_be_enabled()
